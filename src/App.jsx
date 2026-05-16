@@ -58,12 +58,16 @@ async function watchShow(userId, show, action = "add") {
 
 // ── Supabase profile API ──────────────────────────────────────────────────────
 async function fetchProfile(accessToken) {
-  const res = await fetch("/api/profile", {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (!res.ok) return null;
-  const data = await res.json();
-  return data.profile || null;
+  try {
+    const res = await fetch("/api/profile", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.profile || null;
+  } catch {
+    return null;
+  }
 }
 
 async function pushProfile(accessToken, profile, shows) {

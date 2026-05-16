@@ -23,7 +23,32 @@ async function fetchTMEvents(city, genres, artists) {
   return data.events || [];
 }
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Alert registration helpers ────────────────────────────────────────────────
+async function registerUser(email, profile) {
+  const res = await fetch("/api/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      email,
+      city: profile.city,
+      genres: profile.genres,
+      artists: profile.artists,
+    }),
+  });
+  if (!res.ok) throw new Error("Registration failed");
+  return res.json();
+}
+
+async function watchShow(userId, show, action = "add") {
+  const res = await fetch("/api/watch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId, show, action }),
+  });
+  return res.ok;
+}
+
+
 const GENRES = [
   "Electronic / Techno", "House / Deep House", "Melodic Bass / EDM",
   "Hip-Hop / Rap", "R&B / Soul", "Indie / Alternative",
@@ -243,6 +268,11 @@ export default function App() {
   const [tmEvents, setTmEvents]       = useState([]);
   const [tmLoading, setTmLoading]     = useState(false);
   const [tmError, setTmError]         = useState(null);
+  const [alertModal, setAlertModal]   = useState(null); // show object to alert on
+  const [alertEmail, setAlertEmail]   = useState("");
+  const [alertSaving, setAlertSaving] = useState(false);
+  const [alertDone, setAlertDone]     = useState(false);
+  const [userId, setUserId]           = useState(() => load("showup-userid"));
 
   useEffect(() => {
     const p = load(STORAGE_KEYS.profile);
@@ -308,7 +338,29 @@ export default function App() {
     setProfile(next); save(STORAGE_KEYS.profile, next);
   };
 
-  const updateProfile = (updates) => {
+  const saveAlert = async (show) => {
+    if (!alertEmail.trim()) return;
+    setAlertSaving(true);
+    try {
+      let uid = userId;
+      if (!uid) {
+        const result = await registerUser(alertEmail, profile);
+        uid = result.userId;
+        setUserId(uid);
+        save("showup-userid", uid);
+      }
+      await watchShow(uid, show, "add");
+      // Also update local status
+      setAlert(show.id);
+      setAlertDone(true);
+      setTimeout(() => { setAlertModal(null); setAlertDone(false); setAlertEmail(""); }, 2000);
+    } catch (e) {
+      console.error(e);
+    }
+    setAlertSaving(false);
+  };
+
+
     const next = { ...profile, ...updates };
     setProfile(next); save(STORAGE_KEYS.profile, next);
   };
@@ -428,7 +480,7 @@ export default function App() {
               </div>
             ) : (
               <div style={s.showList}>
-                {filtered.map(show => <ShowCard key={show.id} show={show} onSave={toggleSave} onAlert={setAlert} onRemove={removeShow} />)}
+                {filtered.map(show => <ShowCard key={show.id} show={show} onSave={toggleSave} onAlert={setAlertModal} onRemove={removeShow} />)}
               </div>
             )}
           </div>
@@ -489,6 +541,10 @@ export default function App() {
                             ? <span style={{ fontSize: 11, color: "#555" }}>✓ Tracked</span>
                             : <button onClick={() => addShow(show)} style={{ ...s.actionBtn, color: "#a78bfa", borderColor: "rgba(167,139,250,0.3)" }}>+ Track</button>
                           }
+                          {["announced","tba"].includes(show.ticketStatus) && (
+                            <button onClick={() => setAlertModal(show)}
+                              style={{ ...s.actionBtn, color: "#666" }} title="Get notified when tickets go on sale">🔔</button>
+                          )}
                           {show.ticketUrl && (
                             <a href={show.ticketUrl} target="_blank" rel="noreferrer"
                               style={{ ...s.actionBtn, ...s.buyBtn, textDecoration: "none" }}>Tickets</a>
@@ -613,11 +669,49 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Alert Modal */}
+      {alertModal && (
+        <div style={s.modalOverlay} onClick={() => { setAlertModal(null); setAlertDone(false); }}>
+          <div style={s.modalCard} onClick={e => e.stopPropagation()}>
+            <div style={s.modalHeader}>
+              <span style={s.modalTitle}>🔔 Set Alert</span>
+              <button onClick={() => setAlertModal(null)} style={s.modalClose}>×</button>
+            </div>
+            {alertDone ? (
+              <div style={{ textAlign: "center", padding: "20px 0", color: "#4ade80", fontSize: 15 }}>
+                ✓ Alert set! We'll email you when tickets go on sale.
+              </div>
+            ) : (
+              <>
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 15, fontWeight: 600, color: "#fff", marginBottom: 4 }}>{alertModal.artist}</div>
+                  <div style={{ fontSize: 13, color: "#666" }}>{alertModal.venue}{alertModal.date ? ` · ${fmtDate(alertModal.date)}` : ""}</div>
+                </div>
+                <p style={{ fontSize: 13, color: "#666", margin: "0 0 16px" }}>
+                  Enter your email and we'll notify you the moment tickets go on sale.
+                </p>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Email</label>
+                  <input type="email" value={alertEmail} onChange={e => setAlertEmail(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && saveAlert(alertModal)}
+                    placeholder="you@example.com" style={s.input} autoFocus />
+                </div>
+                <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                  <button onClick={() => setAlertModal(null)} style={{ ...s.ghostBtn, flex: 1 }}>Cancel</button>
+                  <button onClick={() => saveAlert(alertModal)} disabled={alertSaving || !alertEmail.trim()}
+                    style={{ ...s.primaryBtn, flex: 2, opacity: alertEmail.trim() ? 1 : 0.4 }}>
+                    {alertSaving ? "Saving..." : "Notify Me →"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
-
-// ── Show Card Component ───────────────────────────────────────────────────────
 function ShowCard({ show, onSave, onAlert, onRemove }) {
   const st = STATUS_CONFIG[show.ticketStatus] || STATUS_CONFIG.tba;
   const past = new Date(show.date + "T23:59:00") < new Date();
@@ -643,7 +737,9 @@ function ShowCard({ show, onSave, onAlert, onRemove }) {
             {show.saved ? "♥" : "♡"}
           </button>
           {["announced","tba"].includes(show.ticketStatus) && (
-            <button onClick={() => onAlert(show.id)} style={{ ...s.actionBtn, color: "#38bdf8" }}>🔔</button>
+            <button onClick={() => onAlert(show)}
+              style={{ ...s.actionBtn, color: show.ticketStatus === "alert_set" ? "#38bdf8" : "#666" }}
+              title="Get notified when tickets go on sale">🔔</button>
           )}
           {show.ticketUrl && ["on_sale","selling_fast"].includes(show.ticketStatus) && (
             <a href={show.ticketUrl} target="_blank" rel="noreferrer"

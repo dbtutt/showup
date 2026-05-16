@@ -7,10 +7,14 @@ create table if not exists users (
   city text not null,
   genres jsonb default '[]',
   artists jsonb default '[]',
+  shows jsonb default '[]',
   push_subscription jsonb default null,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+-- If you already created the users table, add the shows column:
+alter table users add column if not exists shows jsonb default '[]';
 
 -- Watchlist: shows a user is tracking + their last known status
 create table if not exists watchlist (

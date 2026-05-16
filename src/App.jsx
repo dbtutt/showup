@@ -1,13 +1,21 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { supabase } from "./supabase.js";
 
-// ── Storage (localStorage for deployed app) ──────────────────────────────────
+// ── Storage (localStorage as write-through cache) ────────────────────────────
 const STORAGE_KEYS = { profile: "showup-profile", shows: "showup-shows" };
 
 function load(key) {
-  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; }
+  try {
+    const v = localStorage.getItem(key);
+    return v ? JSON.parse(v) : null;
+  } catch {
+    return null;
+  }
 }
 function save(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+  try {
+    localStorage.setItem(key, JSON.stringify(val));
+  } catch {}
 }
 
 // ── Ticketmaster via /api/events proxy ───────────────────────────────────────
@@ -48,7 +56,30 @@ async function watchShow(userId, show, action = "add") {
   return res.ok;
 }
 
+// ── Supabase profile API ──────────────────────────────────────────────────────
+async function fetchProfile(accessToken) {
+  const res = await fetch("/api/profile", {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data.profile || null;
+}
 
+async function pushProfile(accessToken, profile, shows) {
+  try {
+    await fetch("/api/profile", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ ...profile, shows }),
+    });
+  } catch {}
+}
+
+// ── Constants ─────────────────────────────────────────────────────────────────
 const GENRES = [
   "Electronic / Techno", "House / Deep House", "Melodic Bass / EDM",
   "Hip-Hop / Rap", "R&B / Soul", "Indie / Alternative",
@@ -67,20 +98,257 @@ const STATUS_CONFIG = {
 
 function fmtDate(d) {
   if (!d) return "";
-  return new Date(d + "T12:00:00").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+  return new Date(d + "T12:00:00").toLocaleDateString("en-US", {
+    weekday: "short", month: "short", day: "numeric",
+  });
 }
 
 function daysAway(d) {
   if (!d) return "";
-  const diff = Math.ceil((new Date(d + "T12:00:00") - new Date().setHours(0,0,0,0)) / 86400000);
+  const diff = Math.ceil(
+    (new Date(d + "T12:00:00") - new Date().setHours(0, 0, 0, 0)) / 86400000
+  );
   if (diff < 0) return `${Math.abs(diff)}d ago`;
   if (diff === 0) return "Today!";
   if (diff === 1) return "Tomorrow";
   return `${diff} days`;
 }
 
+// ── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const send = async () => {
+    if (!email.trim()) return;
+    setLoading(true);
+    setError(null);
+    const { error: err } = await supabase.auth.signInWithOtp({
+      email: email.trim().toLowerCase(),
+      options: { emailRedirectTo: window.location.origin },
+    });
+    if (err) setError(err.message);
+    else setSent(true);
+    setLoading(false);
+  };
+
+  return (
+    <div style={s.onboardWrap}>
+      <div style={s.onboardCard}>
+        {sent ? (
+          <div style={{ textAlign: "center" }}>
+            <div style={s.onboardLogo}>SHOWUP</div>
+            <div style={{ fontSize: 40, marginBottom: 16 }}>✉️</div>
+            <h2 style={{ ...s.onboardH2, marginBottom: 8 }}>Check your email</h2>
+            <p style={s.onboardHint}>
+              We sent a magic link to{" "}
+              <strong style={{ color: "#c4b5fd" }}>{email}</strong>.<br />
+              Click it to sign in — no password needed.
+            </p>
+            <button onClick={() => setSent(false)} style={{ ...s.ghostBtn, marginTop: 16 }}>
+              Use a different email
+            </button>
+          </div>
+        ) : (
+          <div style={s.onboardStep}>
+            <div style={s.onboardLogo}>SHOWUP</div>
+            <p style={s.onboardSub}>
+              Your personal concert radar.<br />Sign in to save your settings.
+            </p>
+            <div style={s.formGroup}>
+              <label style={s.label}>Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && send()}
+                placeholder="you@example.com"
+                style={s.input}
+                autoFocus
+              />
+            </div>
+            {error && (
+              <div style={{ color: "#f87171", fontSize: 12, marginBottom: 8 }}>
+                {error}
+              </div>
+            )}
+            <button
+              style={{ ...s.primaryBtn, opacity: email.trim() ? 1 : 0.4 }}
+              onClick={send}
+              disabled={loading || !email.trim()}
+            >
+              {loading ? "Sending..." : "Send Magic Link →"}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Spotify Import ────────────────────────────────────────────────────────────
+function SpotifyUpload({ existing, onImport }) {
+  const [found, setFound] = useState([]);
+  const [selected, setSelected] = useState(new Set());
+  const [parsed, setParsed] = useState(false);
+  const [error, setError] = useState(null);
+  const fileRef = useRef();
+
+  const parseJson = (json) => {
+    const artists = new Set();
+    // StreamingHistory format: [{artistName, trackName, ...}]
+    if (Array.isArray(json)) {
+      for (const item of json) {
+        if (item.artistName) artists.add(item.artistName);
+      }
+    }
+    if (json && typeof json === "object" && !Array.isArray(json)) {
+      // YourLibrary format: {tracks: [{artist}], followedArtists: [{name}]}
+      for (const t of json.tracks || []) {
+        if (t.artist) artists.add(t.artist);
+      }
+      for (const a of json.followedArtists || []) {
+        if (a.name) artists.add(a.name);
+      }
+      // Playlist items
+      for (const p of json.playlists || []) {
+        for (const item of p.items || []) {
+          if (item.track?.artistName) artists.add(item.track.artistName);
+        }
+      }
+    }
+    return [...artists].filter(Boolean).sort((a, b) => a.localeCompare(b));
+  };
+
+  const handleFiles = async (files) => {
+    setError(null);
+    const all = new Set();
+    let parseError = null;
+    for (const file of Array.from(files)) {
+      try {
+        const text = await file.text();
+        const json = JSON.parse(text);
+        parseJson(json).forEach((a) => all.add(a));
+      } catch {
+        parseError = `Couldn't parse ${file.name}. Make sure it's a valid Spotify JSON export.`;
+      }
+    }
+    if (parseError) setError(parseError);
+    const existingLower = new Set(existing.map((a) => a.toLowerCase()));
+    const newArtists = [...all].filter(
+      (a) => !existingLower.has(a.toLowerCase())
+    );
+    setFound(newArtists);
+    setSelected(new Set(newArtists));
+    setParsed(true);
+  };
+
+  const toggle = (artist) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(artist)) next.delete(artist);
+      else next.add(artist);
+      return next;
+    });
+  };
+
+  const reset = () => {
+    setParsed(false);
+    setFound([]);
+    setSelected(new Set());
+    setError(null);
+  };
+
+  return (
+    <div style={s.spotifyBox}>
+      <div style={s.spotifyHeader}>
+        <span style={{ color: "#1ed760", marginRight: 6 }}>♫</span>
+        Import from Spotify
+      </div>
+      {!parsed ? (
+        <>
+          <p style={s.spotifyHint}>
+            Upload your Spotify data export JSON files to auto-populate your artist list.
+            Download them at <strong>Spotify → Account → Privacy → Download your data</strong>.
+            Supports <code>StreamingHistory*.json</code>, <code>YourLibrary.json</code>, and{" "}
+            <code>Follow.json</code>.
+          </p>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".json"
+            multiple
+            onChange={(e) => handleFiles(e.target.files)}
+            style={{ display: "none" }}
+          />
+          <button onClick={() => fileRef.current.click()} style={s.ghostBtn}>
+            Choose Spotify JSON files…
+          </button>
+          {error && <div style={s.spotifyError}>{error}</div>}
+        </>
+      ) : found.length === 0 ? (
+        <>
+          <p style={s.spotifyHint}>
+            No new artists found — you may already have them all.
+          </p>
+          <button onClick={reset} style={s.ghostBtn}>
+            Try another file
+          </button>
+        </>
+      ) : (
+        <>
+          <p style={s.spotifyHint}>
+            Found <strong style={{ color: "#fff" }}>{found.length}</strong> new artists.
+            Select which to add:
+          </p>
+          <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+            <button onClick={() => setSelected(new Set(found))} style={s.ghostBtn}>
+              All
+            </button>
+            <button onClick={() => setSelected(new Set())} style={s.ghostBtn}>
+              None
+            </button>
+          </div>
+          <div style={{ ...s.genreGrid, maxHeight: 220, overflowY: "auto", marginBottom: 12 }}>
+            {found.map((a) => (
+              <button
+                key={a}
+                onClick={() => toggle(a)}
+                style={{
+                  ...s.genreChip,
+                  ...(selected.has(a) ? s.genreChipActive : {}),
+                }}
+              >
+                {a}
+              </button>
+            ))}
+          </div>
+          {error && <div style={s.spotifyError}>{error}</div>}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={reset} style={s.ghostBtn}>
+              Cancel
+            </button>
+            <button
+              onClick={() => {
+                onImport([...selected]);
+                reset();
+              }}
+              style={{ ...s.primaryBtn, opacity: selected.size ? 1 : 0.4 }}
+              disabled={!selected.size}
+            >
+              Add {selected.size} artist{selected.size !== 1 ? "s" : ""} →
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── Onboarding ───────────────────────────────────────────────────────────────
-function Onboarding({ onComplete }) {
+function Onboarding({ onComplete, userEmail }) {
   const [step, setStep] = useState(0);
   const [city, setCity] = useState("");
   const [genres, setGenres] = useState([]);
@@ -94,7 +362,9 @@ function Onboarding({ onComplete }) {
     navigator.geolocation?.getCurrentPosition(
       async (pos) => {
         try {
-          const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${pos.coords.latitude}&lon=${pos.coords.longitude}&format=json`);
+          const r = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?lat=${pos.coords.latitude}&lon=${pos.coords.longitude}&format=json`
+          );
           const d = await r.json();
           setCity(d.address?.city || d.address?.town || d.address?.county || "");
         } catch {}
@@ -104,31 +374,41 @@ function Onboarding({ onComplete }) {
     );
   };
 
-  const toggleGenre = (g) => setGenres(prev => prev.includes(g) ? prev.filter(x => x !== g) : [...prev, g]);
+  const toggleGenre = (g) =>
+    setGenres((prev) =>
+      prev.includes(g) ? prev.filter((x) => x !== g) : [...prev, g]
+    );
 
   const addArtist = () => {
     const trimmed = artistInput.trim();
-    if (trimmed && !artists.find(a => a.toLowerCase() === trimmed.toLowerCase())) {
-      setArtists(prev => [...prev, trimmed]);
+    if (trimmed && !artists.find((a) => a.toLowerCase() === trimmed.toLowerCase())) {
+      setArtists((prev) => [...prev, trimmed]);
     }
     setArtistInput("");
     inputRef.current?.focus();
   };
 
-  const removeArtist = (a) => setArtists(prev => prev.filter(x => x !== a));
+  const removeArtist = (a) => setArtists((prev) => prev.filter((x) => x !== a));
 
   const finish = () => {
     const profile = { city, genres, artists, createdAt: Date.now() };
-    save(STORAGE_KEYS.profile, profile);
-    save(STORAGE_KEYS.shows, []);
     onComplete(profile, []);
   };
 
   const steps = [
     <div key="welcome" style={s.onboardStep}>
       <div style={s.onboardLogo}>SHOWUP</div>
-      <p style={s.onboardSub}>Your personal concert radar.<br />Track artists. Never miss a show.</p>
-      <button style={s.primaryBtn} onClick={() => setStep(1)}>Get Started →</button>
+      <p style={s.onboardSub}>
+        Your personal concert radar.<br />Track artists. Never miss a show.
+      </p>
+      {userEmail && (
+        <p style={{ ...s.onboardHint, color: "#4ade80", marginBottom: 20 }}>
+          Signed in as {userEmail}
+        </p>
+      )}
+      <button style={s.primaryBtn} onClick={() => setStep(1)}>
+        Get Started →
+      </button>
     </div>,
 
     <div key="city" style={s.onboardStep}>
@@ -136,46 +416,106 @@ function Onboarding({ onComplete }) {
       <h2 style={s.onboardH2}>Where are you based?</h2>
       <p style={s.onboardHint}>We'll use this to find shows near you.</p>
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <input value={city} onChange={e => setCity(e.target.value)} placeholder="e.g. Amsterdam, New York, Berlin..."
-          style={s.input} onKeyDown={e => e.key === "Enter" && city && setStep(2)} autoFocus />
-        <button onClick={detectCity} style={s.ghostBtn}>{detecting ? "..." : "📍"}</button>
+        <input
+          value={city}
+          onChange={(e) => setCity(e.target.value)}
+          placeholder="e.g. Amsterdam, New York, Berlin..."
+          style={s.input}
+          onKeyDown={(e) => e.key === "Enter" && city && setStep(2)}
+          autoFocus
+        />
+        <button onClick={detectCity} style={s.ghostBtn}>
+          {detecting ? "..." : "📍"}
+        </button>
       </div>
-      <button style={{ ...s.primaryBtn, opacity: city ? 1 : 0.4 }} onClick={() => city && setStep(2)}>Continue →</button>
+      <button
+        style={{ ...s.primaryBtn, opacity: city ? 1 : 0.4 }}
+        onClick={() => city && setStep(2)}
+      >
+        Continue →
+      </button>
     </div>,
 
     <div key="genres" style={s.onboardStep}>
       <div style={s.stepNum}>2 / 2</div>
       <h2 style={s.onboardH2}>What do you listen to?</h2>
-      <p style={s.onboardHint}>Pick your genres — we'll find upcoming shows. You can add specific artists later.</p>
+      <p style={s.onboardHint}>
+        Pick your genres — we'll find upcoming shows. You can add specific artists later.
+      </p>
       <div style={s.genreGrid}>
-        {GENRES.map(g => (
-          <button key={g} onClick={() => toggleGenre(g)}
-            style={{ ...s.genreChip, ...(genres.includes(g) ? s.genreChipActive : {}) }}>{g}</button>
+        {GENRES.map((g) => (
+          <button
+            key={g}
+            onClick={() => toggleGenre(g)}
+            style={{ ...s.genreChip, ...(genres.includes(g) ? s.genreChipActive : {}) }}
+          >
+            {g}
+          </button>
         ))}
       </div>
-      <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
-        <p style={{ ...s.onboardHint, marginBottom: 8 }}>Want to track specific artists? <span style={{ color: "#555" }}>(optional)</span></p>
-        <div style={{ display: "flex", gap: 8, marginBottom: artists.length ? 10 : 0 }}>
-          <input ref={inputRef} value={artistInput} onChange={e => setArtistInput(e.target.value)}
-            placeholder="Artist name..." style={s.input}
-            onKeyDown={e => e.key === "Enter" && artistInput.trim() && addArtist()} />
-          <button onClick={addArtist} style={s.ghostBtn} disabled={!artistInput.trim()}>Add</button>
+      <div
+        style={{
+          marginTop: 20,
+          paddingTop: 16,
+          borderTop: "1px solid rgba(255,255,255,0.06)",
+        }}
+      >
+        <p style={{ ...s.onboardHint, marginBottom: 8 }}>
+          Want to track specific artists?{" "}
+          <span style={{ color: "#555" }}>(optional)</span>
+        </p>
+        <div
+          style={{
+            display: "flex",
+            gap: 8,
+            marginBottom: artists.length ? 10 : 0,
+          }}
+        >
+          <input
+            ref={inputRef}
+            value={artistInput}
+            onChange={(e) => setArtistInput(e.target.value)}
+            placeholder="Artist name..."
+            style={s.input}
+            onKeyDown={(e) =>
+              e.key === "Enter" && artistInput.trim() && addArtist()
+            }
+          />
+          <button
+            onClick={addArtist}
+            style={s.ghostBtn}
+            disabled={!artistInput.trim()}
+          >
+            Add
+          </button>
         </div>
         {artists.length > 0 && (
           <div style={s.artistPillContainer}>
-            {artists.map(a => (
+            {artists.map((a) => (
               <div key={a} style={s.artistPill}>
                 <span>{a}</span>
-                <button onClick={() => removeArtist(a)} style={s.pillRemove}>×</button>
+                <button onClick={() => removeArtist(a)} style={s.pillRemove}>
+                  ×
+                </button>
               </div>
             ))}
           </div>
         )}
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 20 }}>
-        <button style={s.ghostBtn} onClick={() => setStep(1)}>← Back</button>
-        <button style={{ ...s.primaryBtn, flex: 1, opacity: genres.length ? 1 : 0.4 }}
-          onClick={() => genres.length && finish()}>Launch My Radar →</button>
+        <button style={s.ghostBtn} onClick={() => setStep(1)}>
+          ← Back
+        </button>
+        <button
+          style={{
+            ...s.primaryBtn,
+            flex: 1,
+            opacity: genres.length ? 1 : 0.4,
+          }}
+          onClick={() => genres.length && finish()}
+        >
+          Launch My Radar →
+        </button>
       </div>
     </div>,
   ];
@@ -189,12 +529,15 @@ function Onboarding({ onComplete }) {
 
 // ── Add Show Modal ───────────────────────────────────────────────────────────
 function AddShowModal({ artists, onAdd, onClose }) {
-  const [form, setForm] = useState({ artist: "", venue: "", date: "", time: "", price: "", ticketUrl: "", ticketStatus: "announced", notes: "" });
-  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+  const [form, setForm] = useState({
+    artist: "", venue: "", date: "", time: "",
+    price: "", ticketUrl: "", ticketStatus: "announced", notes: "",
+  });
+  const set = (k, v) => setForm((p) => ({ ...p, [k]: v }));
 
   return (
     <div style={s.modalOverlay} onClick={onClose}>
-      <div style={s.modalCard} onClick={e => e.stopPropagation()}>
+      <div style={s.modalCard} onClick={(e) => e.stopPropagation()}>
         <div style={s.modalHeader}>
           <span style={s.modalTitle}>Add Show</span>
           <button onClick={onClose} style={s.modalClose}>×</button>
@@ -202,49 +545,185 @@ function AddShowModal({ artists, onAdd, onClose }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
           <div style={s.formGroup}>
             <label style={s.label}>Artist *</label>
-            <input list="artist-list" value={form.artist} onChange={e => set("artist", e.target.value)}
-              placeholder="Artist name" style={s.input} autoFocus />
-            <datalist id="artist-list">{artists.map(a => <option key={a} value={a} />)}</datalist>
+            <input
+              list="artist-list"
+              value={form.artist}
+              onChange={(e) => set("artist", e.target.value)}
+              placeholder="Artist name"
+              style={s.input}
+              autoFocus
+            />
+            <datalist id="artist-list">
+              {artists.map((a) => (
+                <option key={a} value={a} />
+              ))}
+            </datalist>
           </div>
           <div style={s.formGroup}>
             <label style={s.label}>Venue</label>
-            <input value={form.venue} onChange={e => set("venue", e.target.value)} placeholder="Venue" style={s.input} />
+            <input
+              value={form.venue}
+              onChange={(e) => set("venue", e.target.value)}
+              placeholder="Venue"
+              style={s.input}
+            />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             <div style={s.formGroup}>
               <label style={s.label}>Date *</label>
-              <input type="date" value={form.date} onChange={e => set("date", e.target.value)} style={s.input} />
+              <input
+                type="date"
+                value={form.date}
+                onChange={(e) => set("date", e.target.value)}
+                style={s.input}
+              />
             </div>
             <div style={s.formGroup}>
               <label style={s.label}>Time</label>
-              <input type="time" value={form.time} onChange={e => set("time", e.target.value)} style={s.input} />
+              <input
+                type="time"
+                value={form.time}
+                onChange={(e) => set("time", e.target.value)}
+                style={s.input}
+              />
             </div>
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             <div style={s.formGroup}>
               <label style={s.label}>Price</label>
-              <input value={form.price} onChange={e => set("price", e.target.value)} placeholder="e.g. €35" style={s.input} />
+              <input
+                value={form.price}
+                onChange={(e) => set("price", e.target.value)}
+                placeholder="e.g. €35"
+                style={s.input}
+              />
             </div>
             <div style={s.formGroup}>
               <label style={s.label}>Status</label>
-              <select value={form.ticketStatus} onChange={e => set("ticketStatus", e.target.value)} style={s.select}>
-                {Object.entries(STATUS_CONFIG).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              <select
+                value={form.ticketStatus}
+                onChange={(e) => set("ticketStatus", e.target.value)}
+                style={s.select}
+              >
+                {Object.entries(STATUS_CONFIG).map(([k, v]) => (
+                  <option key={k} value={k}>{v.label}</option>
+                ))}
               </select>
             </div>
           </div>
           <div style={s.formGroup}>
             <label style={s.label}>Ticket URL</label>
-            <input value={form.ticketUrl} onChange={e => set("ticketUrl", e.target.value)} placeholder="https://..." style={s.input} />
+            <input
+              value={form.ticketUrl}
+              onChange={(e) => set("ticketUrl", e.target.value)}
+              placeholder="https://..."
+              style={s.input}
+            />
           </div>
           <div style={s.formGroup}>
             <label style={s.label}>Notes</label>
-            <input value={form.notes} onChange={e => set("notes", e.target.value)} placeholder="e.g. Open air, B2B..." style={s.input} />
+            <input
+              value={form.notes}
+              onChange={(e) => set("notes", e.target.value)}
+              placeholder="e.g. Open air, B2B..."
+              style={s.input}
+            />
           </div>
         </div>
         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-          <button onClick={onClose} style={{ ...s.ghostBtn, flex: 1 }}>Cancel</button>
-          <button onClick={() => (form.artist && form.date) && onAdd(form)}
-            style={{ ...s.primaryBtn, flex: 2, opacity: (form.artist && form.date) ? 1 : 0.4 }}>Add Show</button>
+          <button onClick={onClose} style={{ ...s.ghostBtn, flex: 1 }}>
+            Cancel
+          </button>
+          <button
+            onClick={() => form.artist && form.date && onAdd(form)}
+            style={{
+              ...s.primaryBtn,
+              flex: 2,
+              opacity: form.artist && form.date ? 1 : 0.4,
+            }}
+          >
+            Add Show
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Show Card ─────────────────────────────────────────────────────────────────
+function ShowCard({ show, onSave, onAlert, onRemove }) {
+  const st = STATUS_CONFIG[show.ticketStatus] || STATUS_CONFIG.tba;
+  const past = new Date(show.date + "T23:59:00") < new Date();
+  return (
+    <div style={{ ...s.showCard, opacity: past ? 0.5 : 1 }}>
+      <div style={s.showLeft}>
+        <div style={s.showArtist}>{show.artist}</div>
+        <div style={s.showMeta}>
+          {show.venue && <span>{show.venue}</span>}
+          {show.venue && show.date && <span style={s.dot}>·</span>}
+          {show.date && (
+            <span>
+              {fmtDate(show.date)}
+              {show.time ? ` · ${show.time}` : ""}
+            </span>
+          )}
+          {show.date && (
+            <span style={{ ...s.daysTag, color: past ? "#555" : "#a78bfa" }}>
+              {daysAway(show.date)}
+            </span>
+          )}
+        </div>
+        {show.notes && <div style={s.showNotes}>{show.notes}</div>}
+      </div>
+      <div style={s.showRight}>
+        <div
+          style={{
+            ...s.statusBadge,
+            color: st.color,
+            background: st.bg,
+            border: `1px solid ${st.border}`,
+          }}
+        >
+          <span style={{ ...s.statusDot, background: st.color }} />
+          {st.label}
+        </div>
+        {show.price && <div style={s.price}>{show.price}</div>}
+        <div style={s.showActions}>
+          <button
+            onClick={() => onSave(show.id)}
+            style={{ ...s.actionBtn, color: show.saved ? "#f472b6" : "#555" }}
+          >
+            {show.saved ? "♥" : "♡"}
+          </button>
+          {["announced", "tba"].includes(show.ticketStatus) && (
+            <button
+              onClick={() => onAlert(show)}
+              style={{
+                ...s.actionBtn,
+                color: show.ticketStatus === "alert_set" ? "#38bdf8" : "#666",
+              }}
+              title="Get notified when tickets go on sale"
+            >
+              🔔
+            </button>
+          )}
+          {show.ticketUrl &&
+            ["on_sale", "selling_fast"].includes(show.ticketStatus) && (
+              <a
+                href={show.ticketUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ ...s.actionBtn, ...s.buyBtn, textDecoration: "none" }}
+              >
+                Buy
+              </a>
+            )}
+          <button
+            onClick={() => onRemove(show.id)}
+            style={{ ...s.actionBtn, color: "#333" }}
+          >
+            ✕
+          </button>
         </div>
       </div>
     </div>
@@ -253,42 +732,159 @@ function AddShowModal({ artists, onAdd, onClose }) {
 
 // ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [loading, setLoading]         = useState(true);
-  const [profile, setProfile]         = useState(null);
-  const [shows, setShows]             = useState([]);
-  const [tab, setTab]                 = useState("shows");
-  const [filter, setFilter]           = useState("all");
-  const [search, setSearch]           = useState("");
-  const [addOpen, setAddOpen]         = useState(false);
-  const [aiQuery, setAiQuery]         = useState("");
-  const [aiResult, setAiResult]       = useState(null);
-  const [aiLoading, setAiLoading]     = useState(false);
+  const [session, setSession]           = useState(null);
+  const [authLoading, setAuthLoading]   = useState(true);
+  const [loading, setLoading]           = useState(true);
+  const [profile, setProfile]           = useState(null);
+  const [shows, setShows]               = useState([]);
+  const [tab, setTab]                   = useState("shows");
+  const [filter, setFilter]             = useState("all");
+  const [search, setSearch]             = useState("");
+  const [addOpen, setAddOpen]           = useState(false);
+  const [aiQuery, setAiQuery]           = useState("");
+  const [aiResult, setAiResult]         = useState(null);
+  const [aiLoading, setAiLoading]       = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [newArtist, setNewArtist]     = useState("");
-  const [tmEvents, setTmEvents]       = useState([]);
-  const [tmLoading, setTmLoading]     = useState(false);
-  const [tmError, setTmError]         = useState(null);
-  const [alertModal, setAlertModal]   = useState(null); // show object to alert on
-  const [alertEmail, setAlertEmail]   = useState("");
-  const [alertSaving, setAlertSaving] = useState(false);
-  const [alertDone, setAlertDone]     = useState(false);
-  const [userId, setUserId]           = useState(() => load("showup-userid"));
+  const [newArtist, setNewArtist]       = useState("");
+  const [tmEvents, setTmEvents]         = useState([]);
+  const [tmLoading, setTmLoading]       = useState(false);
+  const [tmError, setTmError]           = useState(null);
+  const [alertModal, setAlertModal]     = useState(null);
+  const [alertEmail, setAlertEmail]     = useState("");
+  const [alertSaving, setAlertSaving]   = useState(false);
+  const [alertDone, setAlertDone]       = useState(false);
+  const [userId, setUserId]             = useState(() => load("showup-userid"));
 
+  // ── Auth init ───────────────────────────────────────────────────────────────
   useEffect(() => {
-    const p = load(STORAGE_KEYS.profile);
-    const sh = load(STORAGE_KEYS.shows);
-    setProfile(p);
-    setShows(sh || []);
-    setLoading(false);
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setSession(s);
+      if (s) loadUserData(s);
+      else { setAuthLoading(false); setLoading(false); }
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, s) => {
+        setSession(s);
+        if (s) loadUserData(s);
+        else {
+          setProfile(null);
+          setShows([]);
+          setAuthLoading(false);
+          setLoading(false);
+        }
+      }
+    );
+    return () => subscription.unsubscribe();
   }, []);
 
+  // Pre-fill alert email from session
+  useEffect(() => {
+    if (session?.user?.email) setAlertEmail(session.user.email);
+  }, [session]);
+
+  const loadUserData = async (s) => {
+    setAuthLoading(false);
+    setLoading(true);
+    try {
+      const dbProfile = await fetchProfile(s.access_token);
+      if (dbProfile) {
+        const dbShows = dbProfile.shows || [];
+        setProfile(dbProfile);
+        setShows(dbShows);
+        save(STORAGE_KEYS.profile, dbProfile);
+        save(STORAGE_KEYS.shows, dbShows);
+      } else {
+        // First login — migrate localStorage data if present
+        const localProfile = load(STORAGE_KEYS.profile);
+        const localShows = load(STORAGE_KEYS.shows) || [];
+        if (localProfile) {
+          setProfile(localProfile);
+          setShows(localShows);
+          await pushProfile(s.access_token, localProfile, localShows);
+        }
+        // else: profile stays null → Onboarding renders
+      }
+    } catch {}
+    setLoading(false);
+  };
+
+  const syncToCloud = useCallback(
+    (nextProfile, nextShows, s = session) => {
+      if (!s) return;
+      pushProfile(s.access_token, nextProfile, nextShows);
+    },
+    [session]
+  );
+
+  // ── Profile helpers ─────────────────────────────────────────────────────────
   const handleOnboard = (p, sh) => {
     setProfile(p);
     setShows(sh);
+    save(STORAGE_KEYS.profile, p);
+    save(STORAGE_KEYS.shows, sh);
+    syncToCloud(p, sh);
     loadTMEvents(p);
     setTab("find");
   };
 
+  const updateProfile = (updates) => {
+    const next = { ...profile, ...updates };
+    setProfile(next);
+    save(STORAGE_KEYS.profile, next);
+    syncToCloud(next, shows);
+  };
+
+  // ── Show helpers ────────────────────────────────────────────────────────────
+  const addShow = (form) => {
+    const show = { ...form, id: Date.now(), saved: false };
+    const next = [...shows, show];
+    setShows(next);
+    save(STORAGE_KEYS.shows, next);
+    setAddOpen(false);
+    syncToCloud(profile, next);
+  };
+
+  const toggleSave = (id) => {
+    const next = shows.map((sh) => (sh.id === id ? { ...sh, saved: !sh.saved } : sh));
+    setShows(next);
+    save(STORAGE_KEYS.shows, next);
+    syncToCloud(profile, next);
+  };
+
+  const setAlert = (id) => {
+    const next = shows.map((sh) =>
+      sh.id === id ? { ...sh, ticketStatus: "alert_set" } : sh
+    );
+    setShows(next);
+    save(STORAGE_KEYS.shows, next);
+    syncToCloud(profile, next);
+  };
+
+  const removeShow = (id) => {
+    const next = shows.filter((sh) => sh.id !== id);
+    setShows(next);
+    save(STORAGE_KEYS.shows, next);
+    syncToCloud(profile, next);
+  };
+
+  // ── Artist helpers ──────────────────────────────────────────────────────────
+  const addArtist = () => {
+    const a = newArtist.trim();
+    if (!a || profile.artists.includes(a)) return;
+    updateProfile({ artists: [...profile.artists, a] });
+    setNewArtist("");
+  };
+
+  const removeArtist = (a) =>
+    updateProfile({ artists: profile.artists.filter((x) => x !== a) });
+
+  const importArtists = (newOnes) => {
+    const merged = [...new Set([...profile.artists, ...newOnes])];
+    updateProfile({ artists: merged });
+  };
+
+  // ── TM Events ───────────────────────────────────────────────────────────────
   const loadTMEvents = async (p) => {
     if (!p?.city) return;
     setTmLoading(true);
@@ -296,48 +892,17 @@ export default function App() {
     try {
       const events = await fetchTMEvents(p.city, p.genres, p.artists);
       setTmEvents(events);
-      if (events.length === 0) setTmError(`No events found in ${p.city} for your genres. Try refreshing or updating your city in Settings.`);
-    } catch (e) {
+      if (events.length === 0)
+        setTmError(
+          `No events found in ${p.city} for your genres. Try refreshing or updating your city in Settings.`
+        );
+    } catch {
       setTmError("Couldn't load events — check your connection and try again.");
     }
     setTmLoading(false);
   };
 
-  const addShow = (form) => {
-    const show = { ...form, id: Date.now(), saved: false };
-    const next = [...shows, show];
-    setShows(next);
-    save(STORAGE_KEYS.shows, next);
-    setAddOpen(false);
-  };
-
-  const toggleSave = (id) => {
-    const next = shows.map(sh => sh.id === id ? { ...sh, saved: !sh.saved } : sh);
-    setShows(next); save(STORAGE_KEYS.shows, next);
-  };
-
-  const setAlert = (id) => {
-    const next = shows.map(sh => sh.id === id ? { ...sh, ticketStatus: "alert_set" } : sh);
-    setShows(next); save(STORAGE_KEYS.shows, next);
-  };
-
-  const removeShow = (id) => {
-    const next = shows.filter(sh => sh.id !== id);
-    setShows(next); save(STORAGE_KEYS.shows, next);
-  };
-
-  const addArtist = () => {
-    const a = newArtist.trim();
-    if (!a || profile.artists.includes(a)) return;
-    const next = { ...profile, artists: [...profile.artists, a] };
-    setProfile(next); save(STORAGE_KEYS.profile, next); setNewArtist("");
-  };
-
-  const removeArtist = (a) => {
-    const next = { ...profile, artists: profile.artists.filter(x => x !== a) };
-    setProfile(next); save(STORAGE_KEYS.profile, next);
-  };
-
+  // ── Alert / email flow ──────────────────────────────────────────────────────
   const saveAlert = async (show) => {
     if (!alertEmail.trim()) return;
     setAlertSaving(true);
@@ -350,26 +915,29 @@ export default function App() {
         save("showup-userid", uid);
       }
       await watchShow(uid, show, "add");
-      // Also update local status
       setAlert(show.id);
       setAlertDone(true);
-      setTimeout(() => { setAlertModal(null); setAlertDone(false); setAlertEmail(""); }, 2000);
+      setTimeout(() => {
+        setAlertModal(null);
+        setAlertDone(false);
+        setAlertEmail(session?.user?.email || "");
+      }, 2000);
     } catch (e) {
       console.error(e);
     }
     setAlertSaving(false);
   };
 
-
-    const next = { ...profile, ...updates };
-    setProfile(next); save(STORAGE_KEYS.profile, next);
-  };
-
+  // ── AI ───────────────────────────────────────────────────────────────────────
   const askAI = async () => {
     if (!aiQuery.trim() || !profile) return;
-    setAiLoading(true); setAiResult(null);
+    setAiLoading(true);
+    setAiResult(null);
     try {
-      const showCtx = shows.map(sh => `${sh.artist} @ ${sh.venue}, ${sh.date} [${sh.ticketStatus}]`).join("\n") || "None yet.";
+      const showCtx =
+        shows
+          .map((sh) => `${sh.artist} @ ${sh.venue}, ${sh.date} [${sh.ticketStatus}]`)
+          .join("\n") || "None yet.";
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -381,35 +949,76 @@ export default function App() {
         }),
       });
       const data = await res.json();
-      setAiResult(data.content?.find(b => b.type === "text")?.text || "No response.");
-    } catch { setAiResult("Something went wrong. Try again."); }
+      setAiResult(
+        data.content?.find((b) => b.type === "text")?.text || "No response."
+      );
+    } catch {
+      setAiResult("Something went wrong. Try again.");
+    }
     setAiLoading(false);
   };
 
-  // Derived
+  // ── Sign out ─────────────────────────────────────────────────────────────────
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    localStorage.clear();
+    setProfile(null);
+    setShows([]);
+    setUserId(null);
+    setSettingsOpen(false);
+  };
+
+  // ── Derived ──────────────────────────────────────────────────────────────────
   const sorted = [...shows].sort((a, b) => new Date(a.date) - new Date(b.date));
-  const filtered = sorted.filter(sh => {
+  const filtered = sorted.filter((sh) => {
     if (filter === "saved" && !sh.saved) return false;
-    if (filter === "on_sale" && !["on_sale","selling_fast"].includes(sh.ticketStatus)) return false;
-    if (filter === "upcoming" && new Date(sh.date + "T23:59:00") < new Date()) return false;
-    if (search && ![sh.artist, sh.venue, sh.notes].join(" ").toLowerCase().includes(search.toLowerCase())) return false;
+    if (filter === "on_sale" && !["on_sale", "selling_fast"].includes(sh.ticketStatus))
+      return false;
+    if (filter === "upcoming" && new Date(sh.date + "T23:59:00") < new Date())
+      return false;
+    if (
+      search &&
+      ![sh.artist, sh.venue, sh.notes]
+        .join(" ")
+        .toLowerCase()
+        .includes(search.toLowerCase())
+    )
+      return false;
     return true;
   });
 
   const stats = {
     total: shows.length,
-    saved: shows.filter(sh => sh.saved).length,
-    onSale: shows.filter(sh => ["on_sale","selling_fast"].includes(sh.ticketStatus)).length,
-    upcoming: shows.filter(sh => new Date(sh.date + "T23:59:00") >= new Date()).length,
+    saved: shows.filter((sh) => sh.saved).length,
+    onSale: shows.filter((sh) =>
+      ["on_sale", "selling_fast"].includes(sh.ticketStatus)
+    ).length,
+    upcoming: shows.filter(
+      (sh) => new Date(sh.date + "T23:59:00") >= new Date()
+    ).length,
   };
 
-  if (loading) return (
-    <div style={{ ...s.app, display: "flex", alignItems: "center", justifyContent: "center", minHeight: "100vh" }}>
-      <div style={{ color: "#444", letterSpacing: 3, fontSize: 12 }}>LOADING...</div>
-    </div>
-  );
+  // ── Render gates ─────────────────────────────────────────────────────────────
+  if (authLoading || loading) {
+    return (
+      <div
+        style={{
+          ...s.app,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          minHeight: "100vh",
+        }}
+      >
+        <div style={{ color: "#444", letterSpacing: 3, fontSize: 12 }}>
+          LOADING...
+        </div>
+      </div>
+    );
+  }
 
-  if (!profile) return <Onboarding onComplete={handleOnboard} />;
+  if (!session) return <LoginScreen />;
+  if (!profile) return <Onboarding onComplete={handleOnboard} userEmail={session.user.email} />;
 
   return (
     <div style={s.app}>
@@ -420,7 +1029,9 @@ export default function App() {
           <div style={s.logo}>SHOWUP</div>
           <div style={s.headerRight}>
             <span style={s.cityTag}>📍 {profile.city}</span>
-            <button onClick={() => setSettingsOpen(true)} style={s.iconBtn}>⚙</button>
+            <button onClick={() => setSettingsOpen(true)} style={s.iconBtn}>
+              ⚙
+            </button>
           </div>
         </div>
       </header>
@@ -433,9 +1044,11 @@ export default function App() {
             { label: "Upcoming", val: stats.upcoming, color: "#fff" },
             { label: "On Sale", val: stats.onSale, color: "#4ade80" },
             { label: "Saved", val: stats.saved, color: "#f472b6" },
-          ].map(st => (
+          ].map((st) => (
             <div key={st.label} style={s.statCard}>
-              <div style={{ ...s.statVal, color: st.color || "#aaa" }}>{st.val}</div>
+              <div style={{ ...s.statVal, color: st.color || "#aaa" }}>
+                {st.val}
+              </div>
               <div style={s.statLabel}>{st.label}</div>
             </div>
           ))}
@@ -448,10 +1061,16 @@ export default function App() {
             { id: "find", label: "Find Shows" },
             { id: "artists", label: "Artists" },
             { id: "ask", label: "Ask AI" },
-          ].map(t => (
-            <button key={t.id}
-              onClick={() => { setTab(t.id); if (t.id === "find" && tmEvents.length === 0 && !tmLoading) loadTMEvents(profile); }}
-              style={{ ...s.tabBtn, ...(tab === t.id ? s.tabActive : {}) }}>
+          ].map((t) => (
+            <button
+              key={t.id}
+              onClick={() => {
+                setTab(t.id);
+                if (t.id === "find" && tmEvents.length === 0 && !tmLoading)
+                  loadTMEvents(profile);
+              }}
+              style={{ ...s.tabBtn, ...(tab === t.id ? s.tabActive : {}) }}
+            >
               {t.label}
             </button>
           ))}
@@ -461,26 +1080,60 @@ export default function App() {
         {tab === "shows" && (
           <div>
             <div style={s.toolbar}>
-              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search shows..."
-                style={{ ...s.input, flex: 1 }} />
-              <button onClick={() => setAddOpen(true)} style={s.primaryBtn}>+ Add Show</button>
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search shows..."
+                style={{ ...s.input, flex: 1 }}
+              />
+              <button onClick={() => setAddOpen(true)} style={s.primaryBtn}>
+                + Add Show
+              </button>
             </div>
             <div style={s.filterRow}>
-              {[["all","All"],["upcoming","Upcoming"],["on_sale","On Sale"],["saved","Saved"]].map(([f,l]) => (
-                <button key={f} onClick={() => setFilter(f)}
-                  style={{ ...s.filterChip, ...(filter === f ? s.filterChipActive : {}) }}>{l}</button>
+              {[
+                ["all", "All"],
+                ["upcoming", "Upcoming"],
+                ["on_sale", "On Sale"],
+                ["saved", "Saved"],
+              ].map(([f, l]) => (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  style={{
+                    ...s.filterChip,
+                    ...(filter === f ? s.filterChipActive : {}),
+                  }}
+                >
+                  {l}
+                </button>
               ))}
             </div>
             {filtered.length === 0 ? (
               <div style={s.empty}>
                 <div style={s.emptyIcon}>🎵</div>
                 <div style={s.emptyText}>No shows here yet</div>
-                <div style={s.emptyHint}>Use Find Shows to discover events, or add one manually</div>
-                <button onClick={() => setAddOpen(true)} style={{ ...s.primaryBtn, marginTop: 16 }}>+ Add Show</button>
+                <div style={s.emptyHint}>
+                  Use Find Shows to discover events, or add one manually
+                </div>
+                <button
+                  onClick={() => setAddOpen(true)}
+                  style={{ ...s.primaryBtn, marginTop: 16 }}
+                >
+                  + Add Show
+                </button>
               </div>
             ) : (
               <div style={s.showList}>
-                {filtered.map(show => <ShowCard key={show.id} show={show} onSave={toggleSave} onAlert={setAlertModal} onRemove={removeShow} />)}
+                {filtered.map((show) => (
+                  <ShowCard
+                    key={show.id}
+                    show={show}
+                    onSave={toggleSave}
+                    onAlert={setAlertModal}
+                    onRemove={removeShow}
+                  />
+                ))}
               </div>
             )}
           </div>
@@ -489,17 +1142,32 @@ export default function App() {
         {/* FIND SHOWS */}
         {tab === "find" && (
           <div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: 16,
+              }}
+            >
               <p style={s.discoverIntro}>
-                Upcoming events in <strong style={{ color: "#fff" }}>{profile.city}</strong> matching your taste.
+                Upcoming events in{" "}
+                <strong style={{ color: "#fff" }}>{profile.city}</strong>{" "}
+                matching your taste.
               </p>
-              <button onClick={() => loadTMEvents(profile)} style={s.ghostBtn} disabled={tmLoading}>
+              <button
+                onClick={() => loadTMEvents(profile)}
+                style={s.ghostBtn}
+                disabled={tmLoading}
+              >
                 {tmLoading ? "Loading..." : "↻ Refresh"}
               </button>
             </div>
             {tmLoading && (
               <div style={s.empty}>
-                <div style={{ color: "#555", letterSpacing: 2, fontSize: 12 }}>SEARCHING...</div>
+                <div style={{ color: "#555", letterSpacing: 2, fontSize: 12 }}>
+                  SEARCHING...
+                </div>
               </div>
             )}
             {!tmLoading && tmError && (
@@ -512,42 +1180,96 @@ export default function App() {
               <div style={s.empty}>
                 <div style={s.emptyIcon}>🔍</div>
                 <div style={s.emptyText}>No events found</div>
-                <div style={s.emptyHint}>Try updating your city or genres in Settings</div>
+                <div style={s.emptyHint}>
+                  Try updating your city or genres in Settings
+                </div>
               </div>
             )}
             {!tmLoading && tmEvents.length > 0 && (
               <div style={s.showList}>
-                {tmEvents.map(show => {
+                {tmEvents.map((show) => {
                   const st = STATUS_CONFIG[show.ticketStatus] || STATUS_CONFIG.tba;
-                  const tracked = shows.some(sh => sh.id === show.id || (sh.artist === show.artist && sh.date === show.date));
+                  const tracked = shows.some(
+                    (sh) =>
+                      sh.id === show.id ||
+                      (sh.artist === show.artist && sh.date === show.date)
+                  );
                   return (
                     <div key={show.id} style={s.showCard}>
                       <div style={s.showLeft}>
                         <div style={s.showArtist}>{show.artist}</div>
                         <div style={s.showMeta}>
                           {show.venue && <span>{show.venue}</span>}
-                          {show.venue && show.date && <span style={s.dot}>·</span>}
-                          {show.date && <span>{fmtDate(show.date)}{show.time ? ` · ${show.time}` : ""}</span>}
-                          {show.date && <span style={{ ...s.daysTag, color: "#a78bfa" }}>{daysAway(show.date)}</span>}
+                          {show.venue && show.date && (
+                            <span style={s.dot}>·</span>
+                          )}
+                          {show.date && (
+                            <span>
+                              {fmtDate(show.date)}
+                              {show.time ? ` · ${show.time}` : ""}
+                            </span>
+                          )}
+                          {show.date && (
+                            <span style={{ ...s.daysTag, color: "#a78bfa" }}>
+                              {daysAway(show.date)}
+                            </span>
+                          )}
                         </div>
                       </div>
                       <div style={s.showRight}>
-                        <div style={{ ...s.statusBadge, color: st.color, background: st.bg, border: `1px solid ${st.border}` }}>
-                          <span style={{ ...s.statusDot, background: st.color }} />{st.label}
+                        <div
+                          style={{
+                            ...s.statusBadge,
+                            color: st.color,
+                            background: st.bg,
+                            border: `1px solid ${st.border}`,
+                          }}
+                        >
+                          <span
+                            style={{ ...s.statusDot, background: st.color }}
+                          />
+                          {st.label}
                         </div>
                         {show.price && <div style={s.price}>{show.price}</div>}
                         <div style={s.showActions}>
-                          {tracked
-                            ? <span style={{ fontSize: 11, color: "#555" }}>✓ Tracked</span>
-                            : <button onClick={() => addShow(show)} style={{ ...s.actionBtn, color: "#a78bfa", borderColor: "rgba(167,139,250,0.3)" }}>+ Track</button>
-                          }
-                          {["announced","tba"].includes(show.ticketStatus) && (
-                            <button onClick={() => setAlertModal(show)}
-                              style={{ ...s.actionBtn, color: "#666" }} title="Get notified when tickets go on sale">🔔</button>
+                          {tracked ? (
+                            <span style={{ fontSize: 11, color: "#555" }}>
+                              ✓ Tracked
+                            </span>
+                          ) : (
+                            <button
+                              onClick={() => addShow(show)}
+                              style={{
+                                ...s.actionBtn,
+                                color: "#a78bfa",
+                                borderColor: "rgba(167,139,250,0.3)",
+                              }}
+                            >
+                              + Track
+                            </button>
+                          )}
+                          {["announced", "tba"].includes(show.ticketStatus) && (
+                            <button
+                              onClick={() => setAlertModal(show)}
+                              style={{ ...s.actionBtn, color: "#666" }}
+                              title="Get notified when tickets go on sale"
+                            >
+                              🔔
+                            </button>
                           )}
                           {show.ticketUrl && (
-                            <a href={show.ticketUrl} target="_blank" rel="noreferrer"
-                              style={{ ...s.actionBtn, ...s.buyBtn, textDecoration: "none" }}>Tickets</a>
+                            <a
+                              href={show.ticketUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{
+                                ...s.actionBtn,
+                                ...s.buyBtn,
+                                textDecoration: "none",
+                              }}
+                            >
+                              Tickets
+                            </a>
                           )}
                         </div>
                       </div>
@@ -563,34 +1285,71 @@ export default function App() {
         {tab === "artists" && (
           <div>
             <div style={s.toolbar}>
-              <input value={newArtist} onChange={e => setNewArtist(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && addArtist()}
-                placeholder="Add an artist..." style={{ ...s.input, flex: 1 }} autoFocus />
-              <button onClick={addArtist} style={s.primaryBtn} disabled={!newArtist.trim()}>Add</button>
+              <input
+                value={newArtist}
+                onChange={(e) => setNewArtist(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addArtist()}
+                placeholder="Add an artist..."
+                style={{ ...s.input, flex: 1 }}
+                autoFocus
+              />
+              <button
+                onClick={addArtist}
+                style={s.primaryBtn}
+                disabled={!newArtist.trim()}
+              >
+                Add
+              </button>
             </div>
+
+            <SpotifyUpload existing={profile.artists} onImport={importArtists} />
+
             {profile.artists.length === 0 ? (
               <div style={s.empty}>
                 <div style={s.emptyIcon}>🎤</div>
                 <div style={s.emptyText}>No artists yet</div>
-                <div style={s.emptyHint}>Add artists to track their upcoming shows specifically</div>
+                <div style={s.emptyHint}>
+                  Add artists to track their upcoming shows specifically
+                </div>
               </div>
             ) : (
               <div style={s.artistGrid}>
-                {profile.artists.map(artist => {
-                  const aShows = shows.filter(sh => sh.artist.toLowerCase() === artist.toLowerCase());
-                  const next = aShows.filter(sh => new Date(sh.date + "T23:59:00") >= new Date())
+                {profile.artists.map((artist) => {
+                  const aShows = shows.filter(
+                    (sh) => sh.artist.toLowerCase() === artist.toLowerCase()
+                  );
+                  const next = aShows
+                    .filter((sh) => new Date(sh.date + "T23:59:00") >= new Date())
                     .sort((a, b) => new Date(a.date) - new Date(b.date))[0];
                   return (
                     <div key={artist} style={s.artistCard}>
                       <div style={s.artistCardTop}>
                         <div style={s.artistName}>{artist}</div>
-                        <button onClick={() => removeArtist(artist)} style={{ ...s.actionBtn, color: "#333", fontSize: 12 }}>✕</button>
+                        <button
+                          onClick={() => removeArtist(artist)}
+                          style={{ ...s.actionBtn, color: "#333", fontSize: 12 }}
+                        >
+                          ✕
+                        </button>
                       </div>
-                      {next
-                        ? <div style={s.artistNext}><span style={{ color: STATUS_CONFIG[next.ticketStatus]?.color || "#555" }}>●</span> {next.venue || "TBA"} · {fmtDate(next.date)}</div>
-                        : <div style={s.artistNoShow}>No upcoming shows tracked</div>
-                      }
-                      <div style={s.artistShowCount}>{aShows.length} show{aShows.length !== 1 ? "s" : ""} tracked</div>
+                      {next ? (
+                        <div style={s.artistNext}>
+                          <span
+                            style={{
+                              color:
+                                STATUS_CONFIG[next.ticketStatus]?.color || "#555",
+                            }}
+                          >
+                            ●
+                          </span>{" "}
+                          {next.venue || "TBA"} · {fmtDate(next.date)}
+                        </div>
+                      ) : (
+                        <div style={s.artistNoShow}>No upcoming shows tracked</div>
+                      )}
+                      <div style={s.artistShowCount}>
+                        {aShows.length} show{aShows.length !== 1 ? "s" : ""} tracked
+                      </div>
                     </div>
                   );
                 })}
@@ -603,7 +1362,8 @@ export default function App() {
         {tab === "ask" && (
           <div>
             <p style={s.discoverIntro}>
-              Ask anything about shows, venues, or artists in <strong style={{ color: "#fff" }}>{profile.city}</strong>.
+              Ask anything about shows, venues, or artists in{" "}
+              <strong style={{ color: "#fff" }}>{profile.city}</strong>.
             </p>
             <div style={s.chipRow}>
               {[
@@ -612,58 +1372,135 @@ export default function App() {
                 "Best venues for my taste?",
                 "How do I not miss on-sale dates?",
                 "What festivals are worth going to?",
-              ].map(q => (
-                <button key={q} onClick={() => setAiQuery(q)} style={s.chip}>{q}</button>
+              ].map((q) => (
+                <button key={q} onClick={() => setAiQuery(q)} style={s.chip}>
+                  {q}
+                </button>
               ))}
             </div>
             <div style={s.toolbar}>
-              <input value={aiQuery} onChange={e => setAiQuery(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && askAI()}
-                placeholder="Ask about shows, artists, venues..." style={{ ...s.input, flex: 1 }} />
-              <button onClick={askAI} disabled={aiLoading} style={{ ...s.primaryBtn, minWidth: 80 }}>
+              <input
+                value={aiQuery}
+                onChange={(e) => setAiQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && askAI()}
+                placeholder="Ask about shows, artists, venues..."
+                style={{ ...s.input, flex: 1 }}
+              />
+              <button
+                onClick={askAI}
+                disabled={aiLoading}
+                style={{ ...s.primaryBtn, minWidth: 80 }}
+              >
                 {aiLoading ? "..." : "Ask →"}
               </button>
             </div>
             {aiResult && (
               <div style={s.aiResult}>
                 <div style={s.aiResultLabel}>SHOWUP AI</div>
-                <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.7 }}>{aiResult}</div>
+                <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.7 }}>
+                  {aiResult}
+                </div>
               </div>
             )}
           </div>
         )}
       </main>
 
-      {addOpen && <AddShowModal artists={profile.artists} onAdd={addShow} onClose={() => setAddOpen(false)} />}
+      {addOpen && (
+        <AddShowModal
+          artists={profile.artists}
+          onAdd={addShow}
+          onClose={() => setAddOpen(false)}
+        />
+      )}
 
+      {/* Settings Modal */}
       {settingsOpen && (
-        <div style={s.modalOverlay} onClick={() => setSettingsOpen(false)}>
-          <div style={s.modalCard} onClick={e => e.stopPropagation()}>
+        <div
+          style={s.modalOverlay}
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div style={s.modalCard} onClick={(e) => e.stopPropagation()}>
             <div style={s.modalHeader}>
               <span style={s.modalTitle}>Settings</span>
-              <button onClick={() => setSettingsOpen(false)} style={s.modalClose}>×</button>
+              <button
+                onClick={() => setSettingsOpen(false)}
+                style={s.modalClose}
+              >
+                ×
+              </button>
             </div>
+            {session?.user?.email && (
+              <div style={s.formGroup}>
+                <label style={s.label}>Signed in as</label>
+                <div style={{ fontSize: 13, color: "#a78bfa", padding: "6px 0" }}>
+                  {session.user.email}
+                </div>
+              </div>
+            )}
             <div style={s.formGroup}>
               <label style={s.label}>Your City</label>
-              <input value={profile.city} onChange={e => updateProfile({ city: e.target.value })} style={s.input} />
+              <input
+                value={profile.city}
+                onChange={(e) => updateProfile({ city: e.target.value })}
+                style={s.input}
+              />
             </div>
             <div style={s.formGroup}>
               <label style={s.label}>Genres</label>
               <div style={s.genreGrid}>
-                {GENRES.map(g => (
-                  <button key={g} onClick={() => updateProfile({ genres: profile.genres.includes(g) ? profile.genres.filter(x => x !== g) : [...profile.genres, g] })}
-                    style={{ ...s.genreChip, ...(profile.genres.includes(g) ? s.genreChipActive : {}) }}>{g}</button>
+                {GENRES.map((g) => (
+                  <button
+                    key={g}
+                    onClick={() =>
+                      updateProfile({
+                        genres: profile.genres.includes(g)
+                          ? profile.genres.filter((x) => x !== g)
+                          : [...profile.genres, g],
+                      })
+                    }
+                    style={{
+                      ...s.genreChip,
+                      ...(profile.genres.includes(g) ? s.genreChipActive : {}),
+                    }}
+                  >
+                    {g}
+                  </button>
                 ))}
               </div>
             </div>
-            <button onClick={() => loadTMEvents(profile)} style={{ ...s.primaryBtn, width: "100%", marginTop: 8 }}>
+            <button
+              onClick={() => loadTMEvents(profile)}
+              style={{ ...s.primaryBtn, width: "100%", marginTop: 8 }}
+            >
               Refresh Show Results
             </button>
-            <button onClick={() => {
-              if (window.confirm("Reset all data?")) {
-                localStorage.clear(); setProfile(null); setShows([]); setSettingsOpen(false);
-              }
-            }} style={{ ...s.ghostBtn, color: "#f87171", borderColor: "rgba(248,113,113,0.3)", marginTop: 8, width: "100%" }}>
+            <button
+              onClick={signOut}
+              style={{
+                ...s.ghostBtn,
+                marginTop: 8,
+                width: "100%",
+                color: "#a78bfa",
+                borderColor: "rgba(167,139,250,0.3)",
+              }}
+            >
+              Sign Out
+            </button>
+            <button
+              onClick={() => {
+                if (window.confirm("Reset all data? This cannot be undone.")) {
+                  signOut();
+                }
+              }}
+              style={{
+                ...s.ghostBtn,
+                color: "#f87171",
+                borderColor: "rgba(248,113,113,0.3)",
+                marginTop: 8,
+                width: "100%",
+              }}
+            >
               Reset All Data
             </button>
           </div>
@@ -672,35 +1509,82 @@ export default function App() {
 
       {/* Alert Modal */}
       {alertModal && (
-        <div style={s.modalOverlay} onClick={() => { setAlertModal(null); setAlertDone(false); }}>
-          <div style={s.modalCard} onClick={e => e.stopPropagation()}>
+        <div
+          style={s.modalOverlay}
+          onClick={() => {
+            setAlertModal(null);
+            setAlertDone(false);
+          }}
+        >
+          <div style={s.modalCard} onClick={(e) => e.stopPropagation()}>
             <div style={s.modalHeader}>
               <span style={s.modalTitle}>🔔 Set Alert</span>
-              <button onClick={() => setAlertModal(null)} style={s.modalClose}>×</button>
+              <button onClick={() => setAlertModal(null)} style={s.modalClose}>
+                ×
+              </button>
             </div>
             {alertDone ? (
-              <div style={{ textAlign: "center", padding: "20px 0", color: "#4ade80", fontSize: 15 }}>
+              <div
+                style={{
+                  textAlign: "center",
+                  padding: "20px 0",
+                  color: "#4ade80",
+                  fontSize: 15,
+                }}
+              >
                 ✓ Alert set! We'll email you when tickets go on sale.
               </div>
             ) : (
               <>
                 <div style={{ marginBottom: 16 }}>
-                  <div style={{ fontSize: 15, fontWeight: 600, color: "#fff", marginBottom: 4 }}>{alertModal.artist}</div>
-                  <div style={{ fontSize: 13, color: "#666" }}>{alertModal.venue}{alertModal.date ? ` · ${fmtDate(alertModal.date)}` : ""}</div>
+                  <div
+                    style={{
+                      fontSize: 15,
+                      fontWeight: 600,
+                      color: "#fff",
+                      marginBottom: 4,
+                    }}
+                  >
+                    {alertModal.artist}
+                  </div>
+                  <div style={{ fontSize: 13, color: "#666" }}>
+                    {alertModal.venue}
+                    {alertModal.date ? ` · ${fmtDate(alertModal.date)}` : ""}
+                  </div>
                 </div>
                 <p style={{ fontSize: 13, color: "#666", margin: "0 0 16px" }}>
-                  Enter your email and we'll notify you the moment tickets go on sale.
+                  We'll notify you the moment tickets go on sale.
                 </p>
                 <div style={s.formGroup}>
                   <label style={s.label}>Email</label>
-                  <input type="email" value={alertEmail} onChange={e => setAlertEmail(e.target.value)}
-                    onKeyDown={e => e.key === "Enter" && saveAlert(alertModal)}
-                    placeholder="you@example.com" style={s.input} autoFocus />
+                  <input
+                    type="email"
+                    value={alertEmail}
+                    onChange={(e) => setAlertEmail(e.target.value)}
+                    onKeyDown={(e) =>
+                      e.key === "Enter" && saveAlert(alertModal)
+                    }
+                    placeholder="you@example.com"
+                    style={s.input}
+                    autoFocus={!session?.user?.email}
+                  />
                 </div>
                 <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-                  <button onClick={() => setAlertModal(null)} style={{ ...s.ghostBtn, flex: 1 }}>Cancel</button>
-                  <button onClick={() => saveAlert(alertModal)} disabled={alertSaving || !alertEmail.trim()}
-                    style={{ ...s.primaryBtn, flex: 2, opacity: alertEmail.trim() ? 1 : 0.4 }}>
+                  <button
+                    onClick={() => setAlertModal(null)}
+                    style={{ ...s.ghostBtn, flex: 1 }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => saveAlert(alertModal)}
+                    disabled={alertSaving || !alertEmail.trim()}
+                    style={{
+                      ...s.primaryBtn,
+                      flex: 2,
+                      opacity: alertEmail.trim() ? 1 : 0.4,
+                    }}
+                  >
                     {alertSaving ? "Saving..." : "Notify Me →"}
                   </button>
                 </div>
@@ -709,45 +1593,6 @@ export default function App() {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-function ShowCard({ show, onSave, onAlert, onRemove }) {
-  const st = STATUS_CONFIG[show.ticketStatus] || STATUS_CONFIG.tba;
-  const past = new Date(show.date + "T23:59:00") < new Date();
-  return (
-    <div style={{ ...s.showCard, opacity: past ? 0.5 : 1 }}>
-      <div style={s.showLeft}>
-        <div style={s.showArtist}>{show.artist}</div>
-        <div style={s.showMeta}>
-          {show.venue && <span>{show.venue}</span>}
-          {show.venue && show.date && <span style={s.dot}>·</span>}
-          {show.date && <span>{fmtDate(show.date)}{show.time ? ` · ${show.time}` : ""}</span>}
-          {show.date && <span style={{ ...s.daysTag, color: past ? "#555" : "#a78bfa" }}>{daysAway(show.date)}</span>}
-        </div>
-        {show.notes && <div style={s.showNotes}>{show.notes}</div>}
-      </div>
-      <div style={s.showRight}>
-        <div style={{ ...s.statusBadge, color: st.color, background: st.bg, border: `1px solid ${st.border}` }}>
-          <span style={{ ...s.statusDot, background: st.color }} />{st.label}
-        </div>
-        {show.price && <div style={s.price}>{show.price}</div>}
-        <div style={s.showActions}>
-          <button onClick={() => onSave(show.id)} style={{ ...s.actionBtn, color: show.saved ? "#f472b6" : "#555" }}>
-            {show.saved ? "♥" : "♡"}
-          </button>
-          {["announced","tba"].includes(show.ticketStatus) && (
-            <button onClick={() => onAlert(show)}
-              style={{ ...s.actionBtn, color: show.ticketStatus === "alert_set" ? "#38bdf8" : "#666" }}
-              title="Get notified when tickets go on sale">🔔</button>
-          )}
-          {show.ticketUrl && ["on_sale","selling_fast"].includes(show.ticketStatus) && (
-            <a href={show.ticketUrl} target="_blank" rel="noreferrer"
-              style={{ ...s.actionBtn, ...s.buyBtn, textDecoration: "none" }}>Buy</a>
-          )}
-          <button onClick={() => onRemove(show.id)} style={{ ...s.actionBtn, color: "#333" }}>✕</button>
-        </div>
-      </div>
     </div>
   );
 }
@@ -830,4 +1675,8 @@ const s = {
   artistPillContainer: { display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 4 },
   artistPill: { display: "flex", alignItems: "center", gap: 6, background: "rgba(167,139,250,0.12)", border: "1px solid rgba(167,139,250,0.3)", color: "#c4b5fd", borderRadius: 20, padding: "4px 10px 4px 12px", fontSize: 13 },
   pillRemove: { background: "none", border: "none", color: "#7c6aaa", cursor: "pointer", fontSize: 16, lineHeight: 1, padding: 0 },
+  spotifyBox: { background: "rgba(30,215,96,0.04)", border: "1px solid rgba(30,215,96,0.15)", borderRadius: 10, padding: "16px 18px", marginBottom: 20 },
+  spotifyHeader: { fontSize: 13, fontWeight: 600, color: "#aaa", marginBottom: 10 },
+  spotifyHint: { fontSize: 12, color: "#555", margin: "0 0 12px", lineHeight: 1.6 },
+  spotifyError: { fontSize: 12, color: "#f87171", marginTop: 8 },
 };
